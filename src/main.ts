@@ -4,18 +4,25 @@ import {
   VaultBridgeSettings,
   VaultBridgeSettingTab,
 } from "./settings";
-import { SyncEngine, SyncStatus, Manifest } from "./sync";
+import { SyncEngine, SyncStatus, VaultIndex } from "./sync";
 
 interface PluginData {
   settings: VaultBridgeSettings;
-  lastKnownManifest?: Manifest;
+  lastKnownIndex?: VaultIndex;
+  // Older versions stored a slimmer "manifest" here. Field kept only so we
+  // can detect and discard it on load.
+  lastKnownManifest?: unknown;
 }
 
-const EMPTY_MANIFEST: Manifest = { files: {}, lastSync: null };
+const EMPTY_INDEX: VaultIndex = {
+  version: 1,
+  files: {},
+  lastUpdated: new Date(0).toISOString(),
+};
 
 export default class VaultBridgePlugin extends Plugin {
   settings!: VaultBridgeSettings;
-  private lastKnownManifest: Manifest = EMPTY_MANIFEST;
+  private lastKnownIndex: VaultIndex = EMPTY_INDEX;
   private engine!: SyncEngine;
   private statusBarItem!: HTMLElement;
   private syncTimer: number | null = null;
@@ -36,9 +43,9 @@ export default class VaultBridgePlugin extends Plugin {
       this.app,
       this.settings,
       (status, msg) => this.setStatus(status, msg),
-      async () => this.lastKnownManifest,
-      async (manifest) => {
-        this.lastKnownManifest = manifest;
+      async () => this.lastKnownIndex,
+      async (index) => {
+        this.lastKnownIndex = index;
         await this.savePluginData();
       }
     );
@@ -92,19 +99,23 @@ export default class VaultBridgePlugin extends Plugin {
   }
 
   async loadPluginData() {
-    const data = ((await this.loadData()) ?? {}) as Partial<PluginData> & Partial<VaultBridgeSettings>;
+    const data = ((await this.loadData()) ?? {}) as Partial<PluginData> &
+      Partial<VaultBridgeSettings>;
 
     // Backwards compat: older versions stored settings at the top level
     const storedSettings = data.settings ?? (data as VaultBridgeSettings);
     this.settings = Object.assign({}, DEFAULT_SETTINGS, storedSettings);
 
-    this.lastKnownManifest = data.lastKnownManifest ?? EMPTY_MANIFEST;
+    // Load the persisted index. The lastKnownManifest field from older
+    // plugin versions is intentionally not migrated — its shape is leaner
+    // than the new index, and the plugin's next sync will rebuild fresh.
+    this.lastKnownIndex = data.lastKnownIndex ?? EMPTY_INDEX;
   }
 
   async savePluginData() {
     const data: PluginData = {
       settings: this.settings,
-      lastKnownManifest: this.lastKnownManifest,
+      lastKnownIndex: this.lastKnownIndex,
     };
     await this.saveData(data);
   }

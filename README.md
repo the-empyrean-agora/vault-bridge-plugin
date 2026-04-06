@@ -66,7 +66,7 @@ Open Settings → Vault Bridge to configure:
 Two action buttons at the bottom of the settings panel:
 
 - **Sync now** — trigger a full sync immediately
-- **Initial upload** — push every file in your vault to R2 (use once when first connecting a vault)
+- **Initial upload** — push every file in your vault to R2 (use once when first connecting a vault, this may take a few minutes to complete)
 
 ## Status bar
 

@@ -1,32 +1,32 @@
 /**
  * Sync engine — bidirectional sync between local Obsidian vault and Cloudflare R2.
  *
- * Algorithm: pull-before-push with manifest comparison.
- *   1. Fetch manifest from R2
- *   2. Compare R2 entries against local files (hash + mtime)
- *   3. Pull files that changed in R2 since last sync (Claude wrote them)
- *   4. Push files that changed locally
- *   5. Handle deletes on both sides
- *   6. Update manifest in R2
+ * Algorithm: pull-before-push with three-way diff.
+ *   1. Build local index (one entry per file: hash + tokens + tags + links + ...)
+ *   2. Fetch remote index from R2
+ *   3. Compare local vs remote vs last-known synced state
+ *   4. Pull files newer in R2, push files newer locally, handle deletes both ways
+ *   5. Push merged index back to R2 and persist locally
  *
  * Conflict policy: R2 wins. Local conflicting version saved as `<name>.conflict.md`.
+ *
+ * The index is stored locally in the plugin's data.json (via main.ts) and in R2
+ * at `{userPrefix}/_vault-bridge-index.json`. The Worker maintains entries on
+ * write_file/delete_file calls so Claude's writes propagate without waiting for
+ * the next plugin sync.
  */
 
-import { App, TFile, normalizePath, Notice, requestUrl } from "obsidian";
+import { App, TFile, normalizePath, requestUrl } from "obsidian";
 import type { VaultBridgeSettings } from "./settings";
+import {
+  parseFile,
+  type FileIndexEntry,
+  type VaultIndex,
+} from "./index-format";
+
+export type { FileIndexEntry, VaultIndex } from "./index-format";
 
 // --- Types ---
-
-export interface ManifestEntry {
-  hash: string;          // sha256 of content
-  modified: string;      // ISO timestamp
-  size: number;
-}
-
-export interface Manifest {
-  files: Record<string, ManifestEntry>;
-  lastSync: string | null;
-}
 
 export type SyncStatus = "idle" | "syncing" | "synced" | "error";
 
@@ -106,15 +106,17 @@ export class SyncEngine {
     private app: App,
     private settings: VaultBridgeSettings,
     private onStatusChange: (status: SyncStatus, message?: string) => void,
-    private loadLastKnown: () => Promise<Manifest>,
-    private saveLastKnown: (manifest: Manifest) => Promise<void>
+    private loadLastKnown: () => Promise<VaultIndex>,
+    private saveLastKnown: (index: VaultIndex) => Promise<void>
   ) {}
 
   /**
-   * Build a manifest of all local files (sorted, with hashes).
+   * Build a complete index of all local files. Each entry includes the
+   * sync metadata (hash/modified/size) plus everything needed for search,
+   * backlinks, tags, and previews.
    */
-  private async buildLocalManifest(): Promise<Map<string, ManifestEntry>> {
-    const local = new Map<string, ManifestEntry>();
+  private async buildLocalIndex(): Promise<Map<string, FileIndexEntry>> {
+    const local = new Map<string, FileIndexEntry>();
     const files = this.app.vault.getFiles();
 
     for (const file of files) {
@@ -122,11 +124,18 @@ export class SyncEngine {
 
       try {
         const content = await this.app.vault.read(file);
-        local.set(file.path, {
-          hash: await sha256(content),
-          modified: new Date(file.stat.mtime).toISOString(),
-          size: file.stat.size,
-        });
+        const hash = await sha256(content);
+        const filename = file.path.split("/").pop() ?? file.path;
+        local.set(
+          file.path,
+          parseFile(
+            content,
+            hash,
+            new Date(file.stat.mtime).toISOString(),
+            file.stat.size,
+            filename
+          )
+        );
       } catch (err) {
         console.warn(`[VaultBridge] Failed to read ${file.path}:`, err);
       }
@@ -136,35 +145,35 @@ export class SyncEngine {
   }
 
   /**
-   * Fetch the remote manifest from R2 (via the relay's sync API).
+   * Fetch the remote vault index from R2 (via the relay's sync API).
    * Uses Obsidian's requestUrl API to bypass CORS in the renderer.
    */
-  private async fetchRemoteManifest(): Promise<Manifest> {
-    const url = `${this.settings.relayUrl}/sync/manifest?token=${this.settings.token}`;
+  private async fetchRemoteIndex(): Promise<VaultIndex> {
+    const url = `${this.settings.relayUrl}/sync/index?token=${this.settings.token}`;
     return withRetry(async () => {
       const resp = await requestUrl({ url, method: "GET", throw: false });
       if (resp.status < 200 || resp.status >= 300) {
-        throw new Error(`Failed to fetch manifest: ${resp.status}`);
+        throw new Error(`Failed to fetch index: ${resp.status}`);
       }
-      return resp.json as Manifest;
+      return resp.json as VaultIndex;
     });
   }
 
   /**
-   * Push the merged manifest back to R2.
+   * Push the merged vault index back to R2.
    */
-  private async putRemoteManifest(manifest: Manifest): Promise<void> {
-    const url = `${this.settings.relayUrl}/sync/manifest?token=${this.settings.token}`;
+  private async putRemoteIndex(index: VaultIndex): Promise<void> {
+    const url = `${this.settings.relayUrl}/sync/index?token=${this.settings.token}`;
     await withRetry(async () => {
       const resp = await requestUrl({
         url,
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(manifest),
+        body: JSON.stringify(index),
         throw: false,
       });
       if (resp.status < 200 || resp.status >= 300) {
-        throw new Error(`Failed to push manifest: ${resp.status}`);
+        throw new Error(`Failed to push index: ${resp.status}`);
       }
     });
   }
@@ -280,8 +289,8 @@ export class SyncEngine {
 
     try {
       // Three-way comparison: local now, remote now, last-known synced state
-      const local = await this.buildLocalManifest();
-      const remote = await this.fetchRemoteManifest();
+      const local = await this.buildLocalIndex();
+      const remote = await this.fetchRemoteIndex();
       const lastKnown = await this.loadLastKnown();
 
       const remoteFiles = remote.files ?? {};
@@ -294,7 +303,7 @@ export class SyncEngine {
       ]);
 
       // The new last-known state we'll save at the end
-      const newLastKnown: Record<string, ManifestEntry> = {};
+      const newLastKnown: Record<string, FileIndexEntry> = {};
 
       for (const path of allPaths) {
         if (isExcluded(path, this.settings.excludedFolders)) continue;
@@ -307,7 +316,7 @@ export class SyncEngine {
           // Case 1: Both local and remote exist
           if (l && r) {
             if (l.hash === r.hash) {
-              // Identical → no-op, just record state
+              // Identical → no-op, just record state (prefer local — it has fresh tokens)
               newLastKnown[path] = l;
               continue;
             }
@@ -325,7 +334,15 @@ export class SyncEngine {
               // Only R2 changed → pull
               const content = await this.pullFile(path);
               await this.writeLocalFile(path, content);
-              newLastKnown[path] = r;
+              // Re-parse the pulled content so the index entry has fresh tokens
+              const filename = path.split("/").pop() ?? path;
+              newLastKnown[path] = parseFile(
+                content,
+                r.hash,
+                r.modified,
+                r.size,
+                filename
+              );
               result.pulled++;
             } else {
               // Both changed → real conflict, R2 wins, save local as .conflict
@@ -336,7 +353,14 @@ export class SyncEngine {
                 result.conflicts++;
               }
               await this.writeLocalFile(path, remoteContent);
-              newLastKnown[path] = r;
+              const filename = path.split("/").pop() ?? path;
+              newLastKnown[path] = parseFile(
+                remoteContent,
+                r.hash,
+                r.modified,
+                r.size,
+                filename
+              );
               result.pulled++;
             }
             continue;
@@ -370,7 +394,14 @@ export class SyncEngine {
               // New remote file (or R2 edited + local deleted = treat as new from R2) → pull
               const content = await this.pullFile(path);
               await this.writeLocalFile(path, content);
-              newLastKnown[path] = r;
+              const filename = path.split("/").pop() ?? path;
+              newLastKnown[path] = parseFile(
+                content,
+                r.hash,
+                r.modified,
+                r.size,
+                filename
+              );
               result.pulled++;
             }
             continue;
@@ -380,17 +411,18 @@ export class SyncEngine {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           result.errors.push(`${path}: ${msg}`);
-          // Preserve last-known entry for this path if anything was there, so we retry next sync
+          // Preserve last-known entry for this path so we retry next sync
           if (k) newLastKnown[path] = k;
         }
       }
 
-      // Push merged manifest to R2 and save locally
-      const merged: Manifest = {
+      // Push merged index to R2 and save locally
+      const merged: VaultIndex = {
+        version: 1,
         files: newLastKnown,
-        lastSync: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
       };
-      await this.putRemoteManifest(merged);
+      await this.putRemoteIndex(merged);
       await this.saveLastKnown(merged);
 
       const totalChanges =
@@ -418,7 +450,7 @@ export class SyncEngine {
 
   /**
    * Initial upload — push every local file to R2 without comparing.
-   * Use once when first connecting a vault.
+   * Use once when first connecting a vault. Builds and pushes the full index.
    */
   async initialUpload(): Promise<SyncResult> {
     const result: SyncResult = {
@@ -433,8 +465,8 @@ export class SyncEngine {
     this.onStatusChange("syncing", "Initial upload...");
 
     try {
-      const local = await this.buildLocalManifest();
-      const newRemoteFiles: Record<string, ManifestEntry> = {};
+      const local = await this.buildLocalIndex();
+      const newRemoteFiles: Record<string, FileIndexEntry> = {};
 
       let i = 0;
       const total = local.size;
@@ -456,12 +488,13 @@ export class SyncEngine {
         }
       }
 
-      const manifest: Manifest = {
+      const index: VaultIndex = {
+        version: 1,
         files: newRemoteFiles,
-        lastSync: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
       };
-      await this.putRemoteManifest(manifest);
-      await this.saveLastKnown(manifest);
+      await this.putRemoteIndex(index);
+      await this.saveLastKnown(index);
 
       this.onStatusChange("synced", `Uploaded ${result.pushed} files`);
       return result;
