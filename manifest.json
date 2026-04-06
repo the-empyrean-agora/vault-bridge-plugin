@@ -1,0 +1,10 @@
+{
+  "id": "vault-bridge",
+  "name": "Vault Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sync your Obsidian vault to Cloudflare R2 so Claude.ai can access it from anywhere — even when your machine is off.",
+  "author": "Leigh",
+  "authorUrl": "https://the-empyrean.com",
+  "isDesktopOnly": false
+}
