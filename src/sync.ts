@@ -160,25 +160,6 @@ export class SyncEngine {
   }
 
   /**
-   * Push the merged vault index back to R2.
-   */
-  private async putRemoteIndex(index: VaultIndex): Promise<void> {
-    const url = `${this.settings.relayUrl}/sync/index?token=${this.settings.token}`;
-    await withRetry(async () => {
-      const resp = await requestUrl({
-        url,
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(index),
-        throw: false,
-      });
-      if (resp.status < 200 || resp.status >= 300) {
-        throw new Error(`Failed to push index: ${resp.status}`);
-      }
-    });
-  }
-
-  /**
    * Download a file from R2.
    */
   private async pullFile(path: string): Promise<string> {
@@ -416,13 +397,16 @@ export class SyncEngine {
         }
       }
 
-      // Push merged index to R2 and save locally
+      // Save the merged state locally as our new "last known" snapshot.
+      // We DO NOT push the index to R2 — the Worker owns the R2 index and
+      // updates it atomically as a side effect of each file upload/delete.
+      // Pushing a whole index from the plugin would race with concurrent
+      // MCP writes from Claude and clobber them.
       const merged: VaultIndex = {
         version: 1,
         files: newLastKnown,
         lastUpdated: new Date().toISOString(),
       };
-      await this.putRemoteIndex(merged);
       await this.saveLastKnown(merged);
 
       const totalChanges =
@@ -488,12 +472,13 @@ export class SyncEngine {
         }
       }
 
+      // Save locally only. The Worker updated the R2 index atomically
+      // for each file we PUT above, so R2's index is already current.
       const index: VaultIndex = {
         version: 1,
         files: newRemoteFiles,
         lastUpdated: new Date().toISOString(),
       };
-      await this.putRemoteIndex(index);
       await this.saveLastKnown(index);
 
       this.onStatusChange("synced", `Uploaded ${result.pushed} files`);
