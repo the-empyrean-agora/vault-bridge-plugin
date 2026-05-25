@@ -56,6 +56,24 @@ function isExcluded(path: string, excluded: string[]): boolean {
   return false;
 }
 
+/**
+ * Include-only scope filter. An empty list means "no scope" — everything is
+ * in scope. With a non-empty list, only paths matching or sitting under one of
+ * the prefixes are in scope.
+ *
+ * MUST be applied uniformly to local, remote, and last-known views in the diff
+ * — out-of-scope paths must never enter the comparison at all. If a path
+ * appeared in last-known but is filtered from local, the diff would mis-read
+ * it as a local delete and push a delete to R2.
+ */
+function isInScope(path: string, scoped: string[]): boolean {
+  if (scoped.length === 0) return true;
+  for (const s of scoped) {
+    if (path === s || path.startsWith(s + "/")) return true;
+  }
+  return false;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -121,6 +139,7 @@ export class SyncEngine {
 
     for (const file of files) {
       if (isExcluded(file.path, this.settings.excludedFolders)) continue;
+      if (!isInScope(file.path, this.settings.scopedFolders)) continue;
 
       try {
         const content = await this.app.vault.read(file);
@@ -288,6 +307,7 @@ export class SyncEngine {
 
       for (const path of allPaths) {
         if (isExcluded(path, this.settings.excludedFolders)) continue;
+        if (!isInScope(path, this.settings.scopedFolders)) continue;
 
         const l = local.get(path);
         const r = remoteFiles[path];

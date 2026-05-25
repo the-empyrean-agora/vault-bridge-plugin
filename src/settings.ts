@@ -8,6 +8,12 @@ export interface VaultBridgeSettings {
   relayUrl: string;
   syncIntervalSeconds: number;
   excludedFolders: string[];
+  /**
+   * Optional include-only filter. If non-empty, only files under one of these
+   * folder prefixes are synced — anything outside is invisible to the diff in
+   * both directions. Empty = sync the whole vault (default).
+   */
+  scopedFolders: string[];
   enabled: boolean;
   /** Email-agent LLM settings — pushed to relay /secrets/llm on save. */
   llmProvider: LlmProvider;
@@ -21,6 +27,7 @@ export const DEFAULT_SETTINGS: VaultBridgeSettings = {
   relayUrl: "https://vault-bridge.the-empyrean.com",
   syncIntervalSeconds: 60,
   excludedFolders: [".obsidian/plugins", ".obsidian/workspace.json", ".trash"],
+  scopedFolders: [],
   enabled: true,
   llmProvider: "anthropic",
   llmApiKey: "",
@@ -113,6 +120,24 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
             this.plugin.settings.excludedFolders = value
               .split(",")
               .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Scoped folders")
+      .setDesc(
+        "Optional. Comma-separated folder paths. If set, ONLY files under these folders are synced (e.g. 'Work, Projects/active'). Files outside the scope on R2 are completely ignored — not pulled, and never treated as local deletes. Leave empty to sync the entire vault."
+      )
+      .addTextArea((text) =>
+        text
+          .setPlaceholder("Work, Projects/active")
+          .setValue(this.plugin.settings.scopedFolders.join(", "))
+          .onChange(async (value) => {
+            this.plugin.settings.scopedFolders = value
+              .split(",")
+              .map((s) => s.trim().replace(/\/$/, ""))
               .filter((s) => s.length > 0);
             await this.plugin.saveSettings();
           })

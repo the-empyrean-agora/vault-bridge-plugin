@@ -62,6 +62,7 @@ Open Settings → Vault Bridge to configure:
 | **Relay URL** | The Vault Bridge relay endpoint — defaults to `https://vault-bridge.the-empyrean.com` |
 | **Sync interval** | How often to do a full sync check (default: 60 seconds) |
 | **Excluded folders** | Comma-separated paths to skip (defaults exclude Obsidian internals) |
+| **Scoped folders** | Optional. If set, sync **only** files under these folders — useful for a secondary device that should see just a subset of the vault (e.g. only `Work/` on a work PC) |
 
 Two action buttons at the bottom of the settings panel:
 
@@ -96,6 +97,17 @@ For example:
 - Open Obsidian on your phone → pulls the change
 - Ask Claude to add to that note → writes to R2
 - Both devices pull the change next time they sync
+
+## Selective sync (secondary devices)
+
+You can limit a device to syncing only certain folders of your vault. This is useful if, for example, you want only a `Work/` folder on your work PC while your home PC syncs the full vault under the same token.
+
+In Settings → Vault Bridge → **Scoped folders**, enter a comma-separated list (e.g. `Work, Projects/active`). With a scope set:
+
+- Only files under those folders are pushed and pulled
+- Files outside the scope on R2 are **completely ignored** — they aren't pulled down, and the plugin won't conclude they should be deleted just because they're missing locally
+- Files outside the scope that already exist locally are left untouched
+- Your other devices (with no scope, or a different scope) continue to sync their own view of the same R2 prefix
 
 ## Build from source
 
