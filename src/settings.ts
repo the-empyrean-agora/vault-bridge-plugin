@@ -25,7 +25,7 @@ export interface VaultBridgeSettings {
 export const DEFAULT_SETTINGS: VaultBridgeSettings = {
   token: "",
   relayUrl: "https://vault-bridge.the-empyrean.com",
-  syncIntervalSeconds: 60,
+  syncIntervalSeconds: 180,
   excludedFolders: [".obsidian/plugins", ".obsidian/workspace.json", ".trash"],
   scopedFolders: [],
   enabled: true,
@@ -92,10 +92,12 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync interval")
-      .setDesc("How often to do a full sync check, in seconds.")
+      .setDesc(
+        "How often to do a full sync check, in seconds. Periodic syncs pause while you're actively typing, so they never overwrite an in-progress edit."
+      )
       .addText((text) =>
         text
-          .setPlaceholder("60")
+          .setPlaceholder("180")
           .setValue(String(this.plugin.settings.syncIntervalSeconds))
           .onChange(async (value) => {
             const n = parseInt(value, 10);

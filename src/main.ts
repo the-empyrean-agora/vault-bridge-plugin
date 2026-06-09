@@ -28,6 +28,10 @@ export default class VaultBridgePlugin extends Plugin {
   private syncTimer: number | null = null;
   private syncInProgress = false;
   private debouncedFileSync: (() => void) | null = null;
+  // Timestamp of the user's most recent edit. The periodic sync uses this as a
+  // write-quiet guard so it never pulls while the user is mid-keystroke.
+  private lastEditTime = 0;
+  private readonly QUIET_PERIOD_MS = 10_000;
   // Track consecutive sync failures so we only bother the user once
   // a transient blip becomes a real persistent problem.
   private consecutiveFailures = 0;
@@ -82,6 +86,16 @@ export default class VaultBridgePlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", (file) => this.onFileChange(file))
+    );
+
+    // Keystroke-level edit signal. The vault "modify" event only fires after
+    // Obsidian flushes the editor buffer to disk — but the clobber happens in
+    // the window *before* that flush. "editor-change" fires on every keystroke,
+    // so it keeps lastEditTime fresh during an active ramble and closes that gap.
+    this.registerEvent(
+      this.app.workspace.on("editor-change", () => {
+        this.lastEditTime = Date.now();
+      })
     );
 
     // Initial sync on load (after Obsidian finishes indexing)
@@ -222,6 +236,10 @@ export default class VaultBridgePlugin extends Plugin {
     for (const ex of this.settings.excludedFolders) {
       if (file.path === ex || file.path.startsWith(ex + "/")) return;
     }
+    // Record the edit so the periodic timer's write-quiet guard knows the user
+    // is active. (editor-change covers in-editor typing pre-flush; this covers
+    // create/delete/rename and external modifications.)
+    this.lastEditTime = Date.now();
     this.debouncedFileSync?.();
   }
 
@@ -233,6 +251,16 @@ export default class VaultBridgePlugin extends Plugin {
 
     const intervalMs = Math.max(10, this.settings.syncIntervalSeconds) * 1000;
     this.syncTimer = window.setInterval(() => {
+      // Write-quiet guard — the actual clobber fix. Don't run a periodic pull
+      // while the user is actively typing: a pull mid-keystroke (before the
+      // editor buffer flushes to disk) overwrites unsaved text, because the
+      // on-disk file still matches last-known and the three-way diff mis-reads
+      // it as "remote-only changed". Defer to a later tick once they pause.
+      // Manual "Sync now" and the post-edit debounced push deliberately bypass
+      // this — they're intentional and quiet-by-construction.
+      if (Date.now() - this.lastEditTime < this.QUIET_PERIOD_MS) {
+        return;
+      }
       this.syncNow().catch(console.error);
     }, intervalMs);
   }
