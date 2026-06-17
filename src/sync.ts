@@ -41,6 +41,18 @@ export interface SyncResult {
 
 // --- Helpers ---
 
+/**
+ * Thrown when the relay rejects a conditional write/delete with 412 — the file
+ * changed in R2 since our snapshot (e.g. Claude wrote it). The sync loop catches
+ * this and reconciles (re-pull + conflict-file) instead of clobbering.
+ */
+class PreconditionFailedError extends Error {
+  constructor(public readonly path: string) {
+    super(`Precondition failed for ${path} (changed remotely)`);
+    this.name = "PreconditionFailedError";
+  }
+}
+
 async function sha256(content: string): Promise<string> {
   const buf = new TextEncoder().encode(content);
   const hash = await crypto.subtle.digest("SHA-256", buf);
@@ -193,18 +205,29 @@ export class SyncEngine {
   }
 
   /**
-   * Upload a file to R2.
+   * Upload a file to R2. Pass `ifMatch` (the base content-hash we're overwriting)
+   * or `ifNoneMatch: "*"` (create-only) to get optimistic-concurrency protection:
+   * the relay returns 412 if the file changed in R2 since our snapshot, which we
+   * surface as PreconditionFailedError for the caller to reconcile.
    */
-  private async pushFile(path: string, content: string): Promise<void> {
+  private async pushFile(
+    path: string,
+    content: string,
+    opts: { ifMatch?: string; ifNoneMatch?: string } = {}
+  ): Promise<void> {
     const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}?token=${this.settings.token}`;
     await withRetry(async () => {
+      const headers: Record<string, string> = { "Content-Type": "text/markdown" };
+      if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+      if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
       const resp = await requestUrl({
         url,
         method: "PUT",
-        headers: { "Content-Type": "text/markdown" },
+        headers,
         body: content,
         throw: false,
       });
+      if (resp.status === 412) throw new PreconditionFailedError(path);
       if (resp.status < 200 || resp.status >= 300) {
         throw new Error(`Failed to push ${path}: ${resp.status}`);
       }
@@ -212,16 +235,60 @@ export class SyncEngine {
   }
 
   /**
-   * Delete a file from R2.
+   * Delete a file from R2. Pass `ifMatch` to guard the delete — the relay
+   * returns 412 (→ PreconditionFailedError) if the file changed in R2 since our
+   * snapshot, so we don't delete a version we never saw.
    */
-  private async deleteRemoteFile(path: string): Promise<void> {
+  private async deleteRemoteFile(
+    path: string,
+    opts: { ifMatch?: string } = {}
+  ): Promise<void> {
     const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}?token=${this.settings.token}`;
     await withRetry(async () => {
-      const resp = await requestUrl({ url, method: "DELETE", throw: false });
+      const headers: Record<string, string> = {};
+      if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
+      const resp = await requestUrl({ url, method: "DELETE", headers, throw: false });
+      if (resp.status === 412) throw new PreconditionFailedError(path);
       if (resp.status < 200 || resp.status >= 300) {
         throw new Error(`Failed to delete ${path}: ${resp.status}`);
       }
     });
+  }
+
+  /**
+   * Reconcile a path after a push/delete was rejected with 412 (it changed in
+   * R2 since our snapshot). Pull the current remote, save the local copy as
+   * `.conflict.md` if it differs, and adopt the remote — the same "R2 wins,
+   * never silently lose" policy as the both-changed branch.
+   */
+  private async reconcileRemoteChange(
+    path: string,
+    result: SyncResult,
+    newLastKnown: Record<string, FileIndexEntry>
+  ): Promise<void> {
+    const remoteContent = await this.pullFile(path);
+    let localContent: string | null = null;
+    try {
+      localContent = await this.readLocalFile(path);
+    } catch {
+      localContent = null; // local may have been deleted — nothing to preserve
+    }
+    if (localContent !== null && localContent !== remoteContent) {
+      await this.writeLocalFile(`${path}.conflict.md`, localContent);
+      result.conflicts++;
+    }
+    await this.writeLocalFile(path, remoteContent);
+    const filename = path.split("/").pop() ?? path;
+    const hash = await sha256(remoteContent);
+    const size = new TextEncoder().encode(remoteContent).length;
+    newLastKnown[path] = parseFile(
+      remoteContent,
+      hash,
+      new Date().toISOString(),
+      size,
+      filename
+    );
+    result.pulled++;
   }
 
   /**
@@ -326,11 +393,19 @@ export class SyncEngine {
             const remoteChanged = !k || r.hash !== k.hash;
 
             if (localChanged && !remoteChanged) {
-              // Only local changed → push
+              // Only local changed → push. Guard on r.hash (the remote base we
+              // believe we're overwriting); if R2 changed since (e.g. Claude
+              // wrote it), the relay 412s and we reconcile instead of clobbering.
               const content = await this.readLocalFile(path);
-              await this.pushFile(path, content);
-              newLastKnown[path] = l;
-              result.pushed++;
+              try {
+                await this.pushFile(path, content, { ifMatch: r.hash });
+                newLastKnown[path] = l;
+                result.pushed++;
+              } catch (err) {
+                if (err instanceof PreconditionFailedError) {
+                  await this.reconcileRemoteChange(path, result, newLastKnown);
+                } else throw err;
+              }
             } else if (!localChanged && remoteChanged) {
               // Only R2 changed → pull
               const content = await this.pullFile(path);
@@ -375,11 +450,19 @@ export class SyncEngine {
               result.deletedLocal++;
               // Don't add to newLastKnown (file gone)
             } else {
-              // New local file (or local edited + R2 deleted = treat as new) → push
+              // New local file (or local edited + R2 deleted = treat as new) →
+              // create-only push; if R2 gained this path since our snapshot, 412
+              // → reconcile rather than clobber.
               const content = await this.readLocalFile(path);
-              await this.pushFile(path, content);
-              newLastKnown[path] = l;
-              result.pushed++;
+              try {
+                await this.pushFile(path, content, { ifNoneMatch: "*" });
+                newLastKnown[path] = l;
+                result.pushed++;
+              } catch (err) {
+                if (err instanceof PreconditionFailedError) {
+                  await this.reconcileRemoteChange(path, result, newLastKnown);
+                } else throw err;
+              }
             }
             continue;
           }
@@ -387,10 +470,18 @@ export class SyncEngine {
           // Case 3: Remote-only
           if (!l && r) {
             if (k && r.hash === k.hash) {
-              // Was previously synced and unchanged in R2 → local deleted it → delete from R2
-              await this.deleteRemoteFile(path);
-              result.deletedRemote++;
-              // Don't add to newLastKnown (file gone)
+              // Was previously synced and unchanged in R2 → local deleted it →
+              // delete from R2. Guard on r.hash: if R2 changed since (Claude
+              // wrote it), don't delete — pull the new version back locally.
+              try {
+                await this.deleteRemoteFile(path, { ifMatch: r.hash });
+                result.deletedRemote++;
+                // Don't add to newLastKnown (file gone)
+              } catch (err) {
+                if (err instanceof PreconditionFailedError) {
+                  await this.reconcileRemoteChange(path, result, newLastKnown);
+                } else throw err;
+              }
             } else {
               // New remote file (or R2 edited + local deleted = treat as new from R2) → pull
               const content = await this.pullFile(path);
