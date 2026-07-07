@@ -1,12 +1,17 @@
 /**
  * Sync engine — bidirectional sync between local Obsidian vault and Cloudflare R2.
  *
- * Algorithm: pull-before-push with three-way diff.
- *   1. Build local index (one entry per file: hash + tokens + tags + links + ...)
- *   2. Fetch remote index from R2
- *   3. Compare local vs remote vs last-known synced state
- *   4. Pull files newer in R2, push files newer locally, handle deletes both ways
- *   5. Push merged index back to R2 and persist locally
+ * Algorithm: pull-before-push with three-way diff, in two phases.
+ *   1. Plan — build local index, fetch remote index, compare local vs remote
+ *      vs last-known synced state; classify every path into a pending op.
+ *      Nothing mutates in this phase.
+ *   2. Apply — execute the ops (pull / push / delete / conflict) with
+ *      per-file progress, then persist the merged index locally.
+ * Between the phases sits the large-sync guardrail: if the plan contains more
+ * mutations (pushes + deletes + conflicts) than settings.largeSyncThreshold,
+ * the sync pauses and requires explicit confirmation before applying —
+ * protection against runaway bulk syncs (see docs/sync-hardening-brief.md in
+ * the relay repo, written after the 2026-07-07 folder-reorg incident).
  *
  * Conflict policy: R2 wins. Local conflicting version saved as `<name>.conflict.md`.
  *
@@ -37,7 +42,45 @@ export interface SyncResult {
   deletedRemote: number;
   conflicts: number;
   errors: string[];
+  /** True when the large-sync guardrail stopped the sync before applying anything. */
+  aborted: boolean;
+  /** The plan the guardrail blocked; present only when aborted. */
+  planned?: SyncSummary;
 }
+
+/** Counts of what a sync is about to do, computed before anything mutates. */
+export interface SyncSummary {
+  pulls: number;
+  pushes: number;
+  deletesLocal: number;
+  deletesRemote: number;
+  conflicts: number;
+  /** pushes + deletes + conflicts — the destructive subset the guardrail counts. */
+  mutations: number;
+}
+
+export interface SyncOptions {
+  /**
+   * Called when the planned diff exceeds settings.largeSyncThreshold.
+   * Return true to apply anyway; returning false — or omitting the callback —
+   * aborts the sync with nothing applied.
+   */
+  confirmLargeSync?: (summary: SyncSummary) => Promise<boolean>;
+}
+
+/**
+ * One pending operation from the plan phase. `r` (the remote index entry at
+ * plan time) doubles as the If-Match base for guarded pushes/deletes; `k`
+ * (last-known) is preserved on per-file errors so the path retries next sync.
+ */
+type PlannedOp =
+  | {
+      action: "push" | "pull" | "conflict" | "delete-remote";
+      path: string;
+      r: FileIndexEntry;
+      k?: FileIndexEntry;
+    }
+  | { action: "push-new" | "delete-local"; path: string; k?: FileIndexEntry };
 
 // --- Helpers ---
 
@@ -127,6 +170,39 @@ async function withRetry<T>(
     }
   }
   throw lastErr;
+}
+
+function summarise(ops: PlannedOp[]): SyncSummary {
+  const s: SyncSummary = {
+    pulls: 0,
+    pushes: 0,
+    deletesLocal: 0,
+    deletesRemote: 0,
+    conflicts: 0,
+    mutations: 0,
+  };
+  for (const op of ops) {
+    switch (op.action) {
+      case "pull":
+        s.pulls++;
+        break;
+      case "push":
+      case "push-new":
+        s.pushes++;
+        break;
+      case "conflict":
+        s.conflicts++;
+        break;
+      case "delete-local":
+        s.deletesLocal++;
+        break;
+      case "delete-remote":
+        s.deletesRemote++;
+        break;
+    }
+  }
+  s.mutations = s.pushes + s.deletesLocal + s.deletesRemote + s.conflicts;
+  return s;
 }
 
 // --- Sync engine ---
@@ -325,6 +401,33 @@ export class SyncEngine {
   }
 
   /**
+   * Read a local file fresh and push it to R2, returning a fresh index entry
+   * for the content actually sent. Re-reading at apply time (rather than
+   * reusing the plan-time entry) matters because the confirmation dialog can
+   * hold a plan open for minutes while the user keeps editing.
+   */
+  private async pushLocalFile(
+    path: string,
+    opts: { ifMatch?: string; ifNoneMatch?: string }
+  ): Promise<FileIndexEntry> {
+    const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
+    if (!(file instanceof TFile)) {
+      throw new Error(`Local file not found: ${path}`);
+    }
+    const content = await this.app.vault.read(file);
+    await this.pushFile(path, content, opts);
+    const hash = await sha256(content);
+    const filename = path.split("/").pop() ?? path;
+    return parseFile(
+      content,
+      hash,
+      new Date(file.stat.mtime).toISOString(),
+      file.stat.size,
+      filename
+    );
+  }
+
+  /**
    * Read a local file's content.
    */
   private async readLocalFile(path: string): Promise<string> {
@@ -336,9 +439,9 @@ export class SyncEngine {
   }
 
   /**
-   * Run a full sync.
+   * Run a full sync (plan → guardrail → apply; see module comment).
    */
-  async sync(): Promise<SyncResult> {
+  async sync(opts: SyncOptions = {}): Promise<SyncResult> {
     const result: SyncResult = {
       pulled: 0,
       pushed: 0,
@@ -346,16 +449,18 @@ export class SyncEngine {
       deletedRemote: 0,
       conflicts: 0,
       errors: [],
+      aborted: false,
     };
 
     if (!this.settings.token) {
       throw new Error("No token configured. Open Vault Bridge settings to add one.");
     }
 
-    this.onStatusChange("syncing", "Syncing...");
+    this.onStatusChange("syncing", "Checking for changes...");
 
     try {
-      // Three-way comparison: local now, remote now, last-known synced state
+      // --- Phase 1: plan. Three-way comparison (local now, remote now,
+      // last-known synced state) classifying every path. No mutations here.
       const local = await this.buildLocalIndex();
       const remote = await this.fetchRemoteIndex();
       const lastKnown = await this.loadLastKnown();
@@ -371,6 +476,7 @@ export class SyncEngine {
 
       // The new last-known state we'll save at the end
       const newLastKnown: Record<string, FileIndexEntry> = {};
+      const ops: PlannedOp[] = [];
 
       for (const path of allPaths) {
         if (isExcluded(path, this.settings.excludedFolders)) continue;
@@ -380,47 +486,140 @@ export class SyncEngine {
         const r = remoteFiles[path];
         const k = lastFiles[path];
 
+        // Case 1: Both local and remote exist
+        if (l && r) {
+          if (l.hash === r.hash) {
+            // Identical → no-op, just record state (prefer local — it has fresh tokens)
+            newLastKnown[path] = l;
+            continue;
+          }
+          const localChanged = !k || l.hash !== k.hash;
+          const remoteChanged = !k || r.hash !== k.hash;
+          if (localChanged && !remoteChanged) {
+            ops.push({ action: "push", path, r, k });
+          } else if (!localChanged && remoteChanged) {
+            ops.push({ action: "pull", path, r, k });
+          } else {
+            ops.push({ action: "conflict", path, r, k });
+          }
+          continue;
+        }
+
+        // Case 2: Local-only
+        if (l && !r) {
+          if (k && l.hash === k.hash) {
+            // Was previously synced and unchanged locally → R2 deleted it → delete locally
+            ops.push({ action: "delete-local", path, k });
+          } else {
+            // New local file (or local edited + R2 deleted = treat as new)
+            ops.push({ action: "push-new", path, k });
+          }
+          continue;
+        }
+
+        // Case 3: Remote-only
+        if (!l && r) {
+          if (k && r.hash === k.hash) {
+            // Was previously synced and unchanged in R2 → local deleted it → delete from R2
+            ops.push({ action: "delete-remote", path, r, k });
+          } else {
+            // New remote file (or R2 edited + local deleted = treat as new from R2) → pull
+            ops.push({ action: "pull", path, r, k });
+          }
+          continue;
+        }
+
+        // Case 4: Tracked in last-known but neither local nor remote exists → drop
+      }
+
+      // --- Guardrail: pause for confirmation on a large diff. Aborting saves
+      // nothing — last-known stays put, so the same plan is recomputed on the
+      // next sync rather than half-applied.
+      const summary = summarise(ops);
+      const threshold = this.settings.largeSyncThreshold;
+      if (threshold > 0 && summary.mutations > threshold) {
+        const ok = opts.confirmLargeSync
+          ? await opts.confirmLargeSync(summary)
+          : false;
+        if (!ok) {
+          result.aborted = true;
+          result.planned = summary;
+          this.onStatusChange(
+            "error",
+            `Sync paused: ${summary.mutations} pending changes — run "Sync now" to review`
+          );
+          return result;
+        }
+      }
+
+      // --- Phase 2: apply ---
+      const total = ops.length;
+      let done = 0;
+      const progress = () => {
+        done++;
+        const deletes = result.deletedLocal + result.deletedRemote;
+        this.onStatusChange(
+          "syncing",
+          `Syncing ${done}/${total} (↓${result.pulled} ↑${result.pushed}${
+            deletes > 0 ? ` ✕${deletes}` : ""
+          })`
+        );
+      };
+
+      for (const op of ops) {
+        const path = op.path;
         try {
-          // Case 1: Both local and remote exist
-          if (l && r) {
-            if (l.hash === r.hash) {
-              // Identical → no-op, just record state (prefer local — it has fresh tokens)
-              newLastKnown[path] = l;
-              continue;
-            }
-
-            const localChanged = !k || l.hash !== k.hash;
-            const remoteChanged = !k || r.hash !== k.hash;
-
-            if (localChanged && !remoteChanged) {
+          switch (op.action) {
+            case "push": {
               // Only local changed → push. Guard on r.hash (the remote base we
               // believe we're overwriting); if R2 changed since (e.g. Claude
               // wrote it), the relay 412s and we reconcile instead of clobbering.
-              const content = await this.readLocalFile(path);
               try {
-                await this.pushFile(path, content, { ifMatch: r.hash });
-                newLastKnown[path] = l;
+                newLastKnown[path] = await this.pushLocalFile(path, {
+                  ifMatch: op.r.hash,
+                });
                 result.pushed++;
               } catch (err) {
                 if (err instanceof PreconditionFailedError) {
                   await this.reconcileRemoteChange(path, result, newLastKnown);
                 } else throw err;
               }
-            } else if (!localChanged && remoteChanged) {
-              // Only R2 changed → pull
+              break;
+            }
+
+            case "push-new": {
+              // Create-only push; if R2 gained this path since our snapshot,
+              // 412 → reconcile rather than clobber.
+              try {
+                newLastKnown[path] = await this.pushLocalFile(path, {
+                  ifNoneMatch: "*",
+                });
+                result.pushed++;
+              } catch (err) {
+                if (err instanceof PreconditionFailedError) {
+                  await this.reconcileRemoteChange(path, result, newLastKnown);
+                } else throw err;
+              }
+              break;
+            }
+
+            case "pull": {
               const content = await this.pullFile(path);
               await this.writeLocalFile(path, content);
               // Re-parse the pulled content so the index entry has fresh tokens
               const filename = path.split("/").pop() ?? path;
               newLastKnown[path] = parseFile(
                 content,
-                r.hash,
-                r.modified,
-                r.size,
+                op.r.hash,
+                op.r.modified,
+                op.r.size,
                 filename
               );
               result.pulled++;
-            } else {
+              break;
+            }
+
+            case "conflict": {
               // Both changed → real conflict, R2 wins, save local as .conflict
               const localContent = await this.readLocalFile(path);
               const remoteContent = await this.pullFile(path);
@@ -432,49 +631,27 @@ export class SyncEngine {
               const filename = path.split("/").pop() ?? path;
               newLastKnown[path] = parseFile(
                 remoteContent,
-                r.hash,
-                r.modified,
-                r.size,
+                op.r.hash,
+                op.r.modified,
+                op.r.size,
                 filename
               );
               result.pulled++;
+              break;
             }
-            continue;
-          }
 
-          // Case 2: Local-only
-          if (l && !r) {
-            if (k && l.hash === k.hash) {
-              // Was previously synced and unchanged locally → R2 deleted it → delete locally
+            case "delete-local": {
               await this.deleteLocalFile(path);
               result.deletedLocal++;
               // Don't add to newLastKnown (file gone)
-            } else {
-              // New local file (or local edited + R2 deleted = treat as new) →
-              // create-only push; if R2 gained this path since our snapshot, 412
-              // → reconcile rather than clobber.
-              const content = await this.readLocalFile(path);
-              try {
-                await this.pushFile(path, content, { ifNoneMatch: "*" });
-                newLastKnown[path] = l;
-                result.pushed++;
-              } catch (err) {
-                if (err instanceof PreconditionFailedError) {
-                  await this.reconcileRemoteChange(path, result, newLastKnown);
-                } else throw err;
-              }
+              break;
             }
-            continue;
-          }
 
-          // Case 3: Remote-only
-          if (!l && r) {
-            if (k && r.hash === k.hash) {
-              // Was previously synced and unchanged in R2 → local deleted it →
-              // delete from R2. Guard on r.hash: if R2 changed since (Claude
-              // wrote it), don't delete — pull the new version back locally.
+            case "delete-remote": {
+              // Guard on r.hash: if R2 changed since (Claude wrote it), don't
+              // delete — pull the new version back locally.
               try {
-                await this.deleteRemoteFile(path, { ifMatch: r.hash });
+                await this.deleteRemoteFile(path, { ifMatch: op.r.hash });
                 result.deletedRemote++;
                 // Don't add to newLastKnown (file gone)
               } catch (err) {
@@ -482,30 +659,16 @@ export class SyncEngine {
                   await this.reconcileRemoteChange(path, result, newLastKnown);
                 } else throw err;
               }
-            } else {
-              // New remote file (or R2 edited + local deleted = treat as new from R2) → pull
-              const content = await this.pullFile(path);
-              await this.writeLocalFile(path, content);
-              const filename = path.split("/").pop() ?? path;
-              newLastKnown[path] = parseFile(
-                content,
-                r.hash,
-                r.modified,
-                r.size,
-                filename
-              );
-              result.pulled++;
+              break;
             }
-            continue;
           }
-
-          // Case 4: Tracked in last-known but neither local nor remote exists → drop
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           result.errors.push(`${path}: ${msg}`);
           // Preserve last-known entry for this path so we retry next sync
-          if (k) newLastKnown[path] = k;
+          if (op.k) newLastKnown[path] = op.k;
         }
+        progress();
       }
 
       // Save the merged state locally as our new "last known" snapshot.
@@ -520,19 +683,19 @@ export class SyncEngine {
       };
       await this.saveLastKnown(merged);
 
-      const totalChanges =
-        result.pulled +
-        result.pushed +
-        result.deletedLocal +
-        result.deletedRemote;
-      const message =
-        totalChanges === 0
-          ? "Up to date"
-          : `Synced (↓${result.pulled} ↑${result.pushed}${
-              result.deletedLocal + result.deletedRemote > 0
-                ? ` ✕${result.deletedLocal + result.deletedRemote}`
-                : ""
-            })`;
+      const deletes = result.deletedLocal + result.deletedRemote;
+      const totalChanges = result.pulled + result.pushed + deletes;
+      let message: string;
+      if (totalChanges === 0 && result.errors.length === 0) {
+        message = "Up to date";
+      } else {
+        message = `Synced (↓${result.pulled} ↑${result.pushed}${
+          deletes > 0 ? ` ✕${deletes}` : ""
+        })`;
+        if (result.errors.length > 0) {
+          message += ` — ${result.errors.length} error(s)`;
+        }
+      }
 
       this.onStatusChange("synced", message);
       return result;
@@ -555,6 +718,7 @@ export class SyncEngine {
       deletedRemote: 0,
       conflicts: 0,
       errors: [],
+      aborted: false,
     };
 
     this.onStatusChange("syncing", "Initial upload...");

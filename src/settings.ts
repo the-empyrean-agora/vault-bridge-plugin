@@ -15,6 +15,12 @@ export interface VaultBridgeSettings {
    */
   scopedFolders: string[];
   enabled: boolean;
+  /**
+   * Guardrail for bulk/structural changes: if a sync plan contains more than
+   * this many mutations (pushes + deletes + conflicts), pause and require
+   * explicit confirmation before applying. 0 disables the check.
+   */
+  largeSyncThreshold: number;
   /** Email-agent LLM settings — pushed to relay /secrets/llm on save. */
   llmProvider: LlmProvider;
   llmApiKey: string;
@@ -29,6 +35,7 @@ export const DEFAULT_SETTINGS: VaultBridgeSettings = {
   excludedFolders: [".obsidian/plugins", ".obsidian/workspace.json", ".trash"],
   scopedFolders: [],
   enabled: true,
+  largeSyncThreshold: 25,
   llmProvider: "anthropic",
   llmApiKey: "",
   llmModel: "",
@@ -110,6 +117,24 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Large sync confirmation threshold")
+      .setDesc(
+        "If a sync would push, delete, or conflict on more than this many files, it pauses and asks for confirmation instead of applying automatically — protection against runaway syncs after folder reorgs. Set to 0 to disable."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("25")
+          .setValue(String(this.plugin.settings.largeSyncThreshold))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= 0) {
+              this.plugin.settings.largeSyncThreshold = n;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Excluded folders")
       .setDesc(
         "Comma-separated list of paths to skip during sync. Defaults exclude Obsidian internals."
@@ -152,7 +177,7 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
       .setDesc("Trigger a full sync immediately.")
       .addButton((btn) =>
         btn.setButtonText("Sync now").onClick(async () => {
-          await this.plugin.syncNow();
+          await this.plugin.syncNow({ interactive: true });
         })
       );
 

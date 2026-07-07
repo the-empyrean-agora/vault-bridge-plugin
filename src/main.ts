@@ -4,11 +4,32 @@ import {
   VaultBridgeSettings,
   VaultBridgeSettingTab,
 } from "./settings";
-import { SyncEngine, SyncStatus, VaultIndex } from "./sync";
+import { SyncEngine, SyncStatus, SyncSummary, VaultIndex } from "./sync";
+import { ConfirmSyncModal } from "./confirm-modal";
+
+/**
+ * One persisted sync outcome — the postmortem trail. Newest first, capped at
+ * SYNC_LOG_LIMIT entries in data.json.
+ */
+export interface SyncLogEntry {
+  at: string;
+  trigger: "manual" | "auto";
+  outcome: "synced" | "aborted" | "failed";
+  durationMs: number;
+  pulled: number;
+  pushed: number;
+  deletedLocal: number;
+  deletedRemote: number;
+  conflicts: number;
+  errors: string[];
+  /** For aborted entries: the plan the guardrail blocked. */
+  planned?: SyncSummary;
+}
 
 interface PluginData {
   settings: VaultBridgeSettings;
   lastKnownIndex?: VaultIndex;
+  syncLog?: SyncLogEntry[];
   // Older versions stored a slimmer "manifest" here. Field kept only so we
   // can detect and discard it on load.
   lastKnownManifest?: unknown;
@@ -36,6 +57,12 @@ export default class VaultBridgePlugin extends Plugin {
   // a transient blip becomes a real persistent problem.
   private consecutiveFailures = 0;
   private readonly FAILURE_NOTICE_THRESHOLD = 3;
+  // Rolling log of recent sync outcomes, persisted in data.json.
+  private syncLog: SyncLogEntry[] = [];
+  private readonly SYNC_LOG_LIMIT = 30;
+  // Signature of the plan the guardrail last blocked, so background syncs
+  // notify once per distinct blocked plan instead of on every timer tick.
+  private lastBlockedSignature: string | null = null;
 
   async onload() {
     await this.loadPluginData();
@@ -59,7 +86,13 @@ export default class VaultBridgePlugin extends Plugin {
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
-      callback: () => this.syncNow(),
+      callback: () => this.syncNow({ interactive: true }),
+    });
+
+    this.addCommand({
+      id: "show-sync-log",
+      name: "Show recent sync log",
+      callback: () => this.showSyncLog(),
     });
 
     this.addCommand({
@@ -124,12 +157,14 @@ export default class VaultBridgePlugin extends Plugin {
     // plugin versions is intentionally not migrated — its shape is leaner
     // than the new index, and the plugin's next sync will rebuild fresh.
     this.lastKnownIndex = data.lastKnownIndex ?? EMPTY_INDEX;
+    this.syncLog = data.syncLog ?? [];
   }
 
   async savePluginData() {
     const data: PluginData = {
       settings: this.settings,
       lastKnownIndex: this.lastKnownIndex,
+      syncLog: this.syncLog,
     };
     await this.saveData(data);
   }
@@ -157,7 +192,13 @@ export default class VaultBridgePlugin extends Plugin {
 
   // --- Sync orchestration ---
 
-  async syncNow(): Promise<void> {
+  /**
+   * Run a sync. `interactive` marks a deliberate user action (command palette,
+   * settings button): when the large-sync guardrail trips, interactive syncs
+   * get the confirmation dialog; background syncs (timer, file-change
+   * debounce, startup) abort quietly with a one-time Notice instead.
+   */
+  async syncNow(opts: { interactive?: boolean } = {}): Promise<void> {
     if (!this.settings.enabled) {
       new Notice("Vault Bridge is disabled. Enable in settings.");
       return;
@@ -173,9 +214,32 @@ export default class VaultBridgePlugin extends Plugin {
     }
 
     this.syncInProgress = true;
+    const startedAt = Date.now();
+    const trigger = opts.interactive ? "manual" : "auto";
     try {
-      const result = await this.engine.sync();
+      const result = await this.engine.sync({
+        confirmLargeSync: async (summary) => {
+          if (opts.interactive) return this.confirmLargeSync(summary);
+          this.notifyBlockedSync(summary);
+          return false;
+        },
+      });
       this.consecutiveFailures = 0;
+      if (!result.aborted) this.lastBlockedSignature = null;
+      await this.recordSync({
+        at: new Date().toISOString(),
+        trigger,
+        outcome: result.aborted ? "aborted" : "synced",
+        durationMs: Date.now() - startedAt,
+        pulled: result.pulled,
+        pushed: result.pushed,
+        deletedLocal: result.deletedLocal,
+        deletedRemote: result.deletedRemote,
+        conflicts: result.conflicts,
+        errors: result.errors.slice(0, 10),
+        planned: result.planned,
+      });
+      if (result.aborted) return;
       if (result.errors.length > 0) {
         new Notice(
           `Vault Bridge: sync completed with ${result.errors.length} error(s). Check console.`
@@ -193,6 +257,18 @@ export default class VaultBridgePlugin extends Plugin {
         `[VaultBridge] Sync failed (${this.consecutiveFailures}):`,
         err
       );
+      await this.recordSync({
+        at: new Date().toISOString(),
+        trigger,
+        outcome: "failed",
+        durationMs: Date.now() - startedAt,
+        pulled: 0,
+        pushed: 0,
+        deletedLocal: 0,
+        deletedRemote: 0,
+        conflicts: 0,
+        errors: [err instanceof Error ? err.message : String(err)],
+      });
       // Only show a Notice if we've failed several times in a row.
       // Single transient failures self-heal on the next sync.
       if (this.consecutiveFailures >= this.FAILURE_NOTICE_THRESHOLD) {
@@ -205,6 +281,75 @@ export default class VaultBridgePlugin extends Plugin {
     } finally {
       this.syncInProgress = false;
     }
+  }
+
+  /** Show the large-sync confirmation dialog; resolves with the user's choice. */
+  private confirmLargeSync(summary: SyncSummary): Promise<boolean> {
+    return new Promise((resolve) => {
+      new ConfirmSyncModal(
+        this.app,
+        summary,
+        this.settings.largeSyncThreshold,
+        resolve
+      ).open();
+    });
+  }
+
+  /** One-time Notice when a background sync is paused by the guardrail. */
+  private notifyBlockedSync(summary: SyncSummary): void {
+    const sig = [
+      summary.pulls,
+      summary.pushes,
+      summary.deletesLocal,
+      summary.deletesRemote,
+      summary.conflicts,
+    ].join("/");
+    if (sig === this.lastBlockedSignature) return;
+    this.lastBlockedSignature = sig;
+    new Notice(
+      `Vault Bridge: sync paused — ${summary.mutations} pending changes (↑${summary.pushes} ✕${summary.deletesLocal + summary.deletesRemote} conflicts ${summary.conflicts}) exceed the confirmation threshold. Run "Sync now" to review and apply.`,
+      10_000
+    );
+  }
+
+  /** Append to the persisted sync log. Never throws — logging must not break sync. */
+  private async recordSync(entry: SyncLogEntry): Promise<void> {
+    try {
+      this.syncLog.unshift(entry);
+      if (this.syncLog.length > this.SYNC_LOG_LIMIT) {
+        this.syncLog.length = this.SYNC_LOG_LIMIT;
+      }
+      await this.savePluginData();
+    } catch (err) {
+      console.warn("[VaultBridge] Failed to persist sync log:", err);
+    }
+  }
+
+  private showSyncLog(): void {
+    if (this.syncLog.length === 0) {
+      new Notice("Vault Bridge: no syncs recorded yet.");
+      return;
+    }
+    console.log("[VaultBridge] Sync log (newest first):", this.syncLog);
+    const lines = this.syncLog.slice(0, 5).map((e) => {
+      const time = new Date(e.at).toLocaleTimeString();
+      if (e.outcome === "aborted") {
+        return `${time} ${e.trigger}: paused (${e.planned?.mutations ?? "?"} pending)`;
+      }
+      if (e.outcome === "failed") {
+        return `${time} ${e.trigger}: failed — ${e.errors[0] ?? "unknown"}`;
+      }
+      const deletes = e.deletedLocal + e.deletedRemote;
+      const extras =
+        (deletes > 0 ? ` ✕${deletes}` : "") +
+        (e.conflicts > 0 ? ` ⚠${e.conflicts}` : "") +
+        (e.errors.length > 0 ? `, ${e.errors.length} err` : "");
+      return `${time} ${e.trigger}: ↓${e.pulled} ↑${e.pushed}${extras}`;
+    });
+    new Notice(
+      `Vault Bridge — recent syncs:\n${lines.join("\n")}\n(full log in console)`,
+      15_000
+    );
   }
 
   async initialUpload(): Promise<void> {
