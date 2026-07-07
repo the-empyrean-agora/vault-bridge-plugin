@@ -63,6 +63,10 @@ export default class VaultBridgePlugin extends Plugin {
   // Signature of the plan the guardrail last blocked, so background syncs
   // notify once per distinct blocked plan instead of on every timer tick.
   private lastBlockedSignature: string | null = null;
+  // Consecutive background syncs deferred to the remote-write lease. Past the
+  // cap the next sync proceeds anyway, so a stuck lease can't freeze sync.
+  private consecutiveDefers = 0;
+  private readonly MAX_REMOTE_WRITE_DEFERS = 4;
 
   async onload() {
     await this.loadPluginData();
@@ -223,8 +227,18 @@ export default class VaultBridgePlugin extends Plugin {
           this.notifyBlockedSync(summary);
           return false;
         },
+        deferOnRemoteWrite:
+          !opts.interactive &&
+          this.consecutiveDefers < this.MAX_REMOTE_WRITE_DEFERS,
       });
       this.consecutiveFailures = 0;
+      if (result.deferred) {
+        // Not logged — defers are routine while Claude is writing; the next
+        // tick (or the max-defer cap) picks the changes up.
+        this.consecutiveDefers++;
+        return;
+      }
+      this.consecutiveDefers = 0;
       if (!result.aborted) this.lastBlockedSignature = null;
       await this.recordSync({
         at: new Date().toISOString(),

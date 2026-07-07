@@ -44,6 +44,8 @@ export interface SyncResult {
   errors: string[];
   /** True when the large-sync guardrail stopped the sync before applying anything. */
   aborted: boolean;
+  /** True when the sync stepped aside for an active remote-write lease. */
+  deferred: boolean;
   /** The plan the guardrail blocked; present only when aborted. */
   planned?: SyncSummary;
 }
@@ -66,6 +68,12 @@ export interface SyncOptions {
    * aborts the sync with nothing applied.
    */
   confirmLargeSync?: (summary: SyncSummary) => Promise<boolean>;
+  /**
+   * Step aside while the relay reports an active remote-write lease (Claude
+   * mid-burst). Background syncs set this; manual syncs don't. The caller
+   * enforces a max-defer cap so a stuck lease can't freeze sync forever.
+   */
+  deferOnRemoteWrite?: boolean;
 }
 
 /**
@@ -254,15 +262,28 @@ export class SyncEngine {
   /**
    * Fetch the remote vault index from R2 (via the relay's sync API).
    * Uses Obsidian's requestUrl API to bypass CORS in the renderer.
+   *
+   * The relay sets `X-Remote-Write-Active: 1` while an MCP write burst
+   * (Claude editing) is in flight — the write-lease a background sync defers
+   * to. Absent header (older relay) reads as inactive.
    */
-  private async fetchRemoteIndex(): Promise<VaultIndex> {
+  private async fetchRemoteIndex(): Promise<{
+    index: VaultIndex;
+    remoteWriteActive: boolean;
+  }> {
     const url = `${this.settings.relayUrl}/sync/index?token=${this.settings.token}`;
     return withRetry(async () => {
       const resp = await requestUrl({ url, method: "GET", throw: false });
       if (resp.status < 200 || resp.status >= 300) {
         throw new Error(`Failed to fetch index: ${resp.status}`);
       }
-      return resp.json as VaultIndex;
+      const headers = resp.headers ?? {};
+      const lease =
+        headers["x-remote-write-active"] ?? headers["X-Remote-Write-Active"];
+      return {
+        index: resp.json as VaultIndex,
+        remoteWriteActive: lease === "1",
+      };
     });
   }
 
@@ -450,6 +471,7 @@ export class SyncEngine {
       conflicts: 0,
       errors: [],
       aborted: false,
+      deferred: false,
     };
 
     if (!this.settings.token) {
@@ -459,10 +481,18 @@ export class SyncEngine {
     this.onStatusChange("syncing", "Checking for changes...");
 
     try {
+      // Fetch remote first: if a remote-write lease is active, a background
+      // sync steps aside before paying for the full local vault scan.
+      const { index: remote, remoteWriteActive } = await this.fetchRemoteIndex();
+      if (remoteWriteActive && opts.deferOnRemoteWrite) {
+        result.deferred = true;
+        this.onStatusChange("idle", "Sync deferred — remote write in progress");
+        return result;
+      }
+
       // --- Phase 1: plan. Three-way comparison (local now, remote now,
       // last-known synced state) classifying every path. No mutations here.
       const local = await this.buildLocalIndex();
-      const remote = await this.fetchRemoteIndex();
       const lastKnown = await this.loadLastKnown();
 
       const remoteFiles = remote.files ?? {};
@@ -719,6 +749,7 @@ export class SyncEngine {
       conflicts: 0,
       errors: [],
       aborted: false,
+      deferred: false,
     };
 
     this.onStatusChange("syncing", "Initial upload...");
