@@ -61,6 +61,14 @@ export interface SyncSummary {
   mutations: number;
 }
 
+/** Outcome of a move batch: successes already rekeyed in last-known. */
+export interface MoveBatchResult {
+  moved: number;
+  /** Moves the relay refused (404/409/412) or that never left the plugin —
+   *  the caller reconciles these with a normal full sync. */
+  failed: Array<{ from: string; to: string; status: number }>;
+}
+
 export interface SyncOptions {
   /**
    * Called when the planned diff exceeds settings.largeSyncThreshold.
@@ -112,7 +120,7 @@ async function sha256(content: string): Promise<string> {
     .join("");
 }
 
-function isExcluded(path: string, excluded: string[]): boolean {
+export function isExcluded(path: string, excluded: string[]): boolean {
   for (const ex of excluded) {
     if (path === ex || path.startsWith(ex + "/")) return true;
   }
@@ -129,7 +137,7 @@ function isExcluded(path: string, excluded: string[]): boolean {
  * appeared in last-known but is filtered from local, the diff would mis-read
  * it as a local delete and push a delete to R2.
  */
-function isInScope(path: string, scoped: string[]): boolean {
+export function isInScope(path: string, scoped: string[]): boolean {
   if (scoped.length === 0) return true;
   for (const s of scoped) {
     if (path === s || path.startsWith(s + "/")) return true;
@@ -350,6 +358,113 @@ export class SyncEngine {
         throw new Error(`Failed to delete ${path}: ${resp.status}`);
       }
     });
+  }
+
+  /**
+   * POST one chunk of moves to the relay. Returns the per-item results; a
+   * non-2xx overall response throws (→ caller falls back to a full sync).
+   */
+  private async postMoves(
+    items: Array<{ from: string; to: string; ifMatch?: string }>
+  ): Promise<Array<{ from: string; to: string; status: number }>> {
+    const url = `${this.settings.relayUrl}/sync/move?token=${this.settings.token}`;
+    return withRetry(async () => {
+      const resp = await requestUrl({
+        url,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ moves: items }),
+        throw: false,
+      });
+      if (resp.status < 200 || resp.status >= 300) {
+        throw new Error(`Move batch failed: ${resp.status}`);
+      }
+      return (
+        resp.json as {
+          results: Array<{ from: string; to: string; status: number }>;
+        }
+      ).results;
+    });
+  }
+
+  /**
+   * Send local renames to the relay as first-class moves (O3 of the relay's
+   * docs/sync-hardening-brief.md): the R2 key is renamed server-side and the
+   * index row follows — zero content transfer, no delete+create churn, no
+   * conflict surface. Each move is guarded with `ifMatch` = the last-known
+   * hash of the source, so a file Claude rewrote since our snapshot 412s
+   * instead of moving a version we never saw.
+   *
+   * On per-item success the last-known index is rekeyed in place (same entry,
+   * new path) so the next diff sees nothing to do. Failures (404/409/412, or
+   * a whole-chunk error) are returned for the caller to reconcile with a
+   * normal full sync — the O1 guardrail is the backstop. Rekeys that
+   * succeeded before a failure are persisted regardless, so a partial batch
+   * never leaves ghosts.
+   */
+  async moveBatch(
+    moves: Array<{ from: string; to: string }>
+  ): Promise<MoveBatchResult> {
+    const result: MoveBatchResult = { moved: 0, failed: [] };
+    if (moves.length === 0) return result;
+
+    const lastKnown = await this.loadLastKnown();
+    const files = { ...(lastKnown.files ?? {}) };
+
+    // Only files the remote knows about can be moved remotely. Anything not
+    // in last-known (created since the last sync) would just 404 — route it
+    // straight to the full-sync fallback without a wasted request.
+    const known: Array<{ from: string; to: string; ifMatch?: string }> = [];
+    for (const m of moves) {
+      const entry = files[m.from];
+      if (entry) known.push({ from: m.from, to: m.to, ifMatch: entry.hash });
+      else result.failed.push({ from: m.from, to: m.to, status: 404 });
+    }
+    if (known.length === 0) return result;
+
+    this.onStatusChange("syncing", `Moving ${known.length} file(s)...`);
+    const CHUNK = 100; // mirrors the relay's per-request cap
+    try {
+      for (let i = 0; i < known.length; i += CHUNK) {
+        const chunk = known.slice(i, i + CHUNK);
+        const results = await this.postMoves(chunk);
+        for (const r of results) {
+          if (r.status === 200) {
+            const entry = files[r.from];
+            if (entry) {
+              delete files[r.from];
+              files[r.to] = entry;
+            }
+            result.moved++;
+          } else {
+            result.failed.push(r);
+          }
+        }
+        if (known.length > CHUNK) {
+          this.onStatusChange(
+            "syncing",
+            `Moving ${Math.min(i + CHUNK, known.length)}/${known.length}...`
+          );
+        }
+      }
+    } finally {
+      if (result.moved > 0) {
+        await this.saveLastKnown({
+          version: 1,
+          files,
+          lastUpdated: new Date().toISOString(),
+        });
+      }
+    }
+
+    this.onStatusChange(
+      "synced",
+      `Moved ${result.moved} file(s)` +
+        (result.failed.length > 0
+          ? ` — ${result.failed.length} deferred to full sync`
+          : "")
+    );
+    return result;
   }
 
   /**

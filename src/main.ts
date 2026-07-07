@@ -1,10 +1,17 @@
-import { Notice, Plugin, TFile, TAbstractFile, debounce } from "obsidian";
+import { Notice, Plugin, TFile, TFolder, TAbstractFile, debounce } from "obsidian";
 import {
   DEFAULT_SETTINGS,
   VaultBridgeSettings,
   VaultBridgeSettingTab,
 } from "./settings";
-import { SyncEngine, SyncStatus, SyncSummary, VaultIndex } from "./sync";
+import {
+  SyncEngine,
+  SyncStatus,
+  SyncSummary,
+  VaultIndex,
+  isExcluded,
+  isInScope,
+} from "./sync";
 import { ConfirmSyncModal } from "./confirm-modal";
 
 /**
@@ -24,6 +31,8 @@ export interface SyncLogEntry {
   errors: string[];
   /** For aborted entries: the plan the guardrail blocked. */
   planned?: SyncSummary;
+  /** For move batches: files renamed remotely (no content transferred). */
+  moved?: number;
 }
 
 interface PluginData {
@@ -67,6 +76,13 @@ export default class VaultBridgePlugin extends Plugin {
   // cap the next sync proceeds anyway, so a stuck lease can't freeze sync.
   private consecutiveDefers = 0;
   private readonly MAX_REMOTE_WRITE_DEFERS = 4;
+  // Renames captured from vault events, keyed by ORIGINAL old path → current
+  // new path (chains A→B→C coalesce to A→C, A→B→A cancels out). Flushed as a
+  // batched POST /sync/move ~2s after the last rename; while anything is
+  // pending, background full syncs stand down so a mid-batch diff can't see
+  // delete+create ghosts.
+  private pendingMoves = new Map<string, string>();
+  private debouncedMoveFlush: (() => void) | null = null;
 
   async onload() {
     await this.loadPluginData();
@@ -112,6 +128,13 @@ export default class VaultBridgePlugin extends Plugin {
       true
     );
 
+    // Debounced move flush — renames coalesce for 2s, then ship as one batch.
+    this.debouncedMoveFlush = debounce(
+      () => this.flushPendingMoves().catch(console.error),
+      2000,
+      true
+    );
+
     this.registerEvent(
       this.app.vault.on("modify", (file) => this.onFileChange(file))
     );
@@ -122,7 +145,9 @@ export default class VaultBridgePlugin extends Plugin {
       this.app.vault.on("delete", (file) => this.onFileChange(file))
     );
     this.registerEvent(
-      this.app.vault.on("rename", (file) => this.onFileChange(file))
+      this.app.vault.on("rename", (file, oldPath) =>
+        this.onFileRename(file, oldPath)
+      )
     );
 
     // Keystroke-level edit signal. The vault "modify" event only fires after
@@ -210,6 +235,13 @@ export default class VaultBridgePlugin extends Plugin {
     if (!this.settings.token) {
       new Notice("Vault Bridge: no token configured. Open settings.");
       return;
+    }
+    if (this.pendingMoves.size > 0) {
+      // Renames are still coalescing. A full sync now would see the move as
+      // delete+create ghosts, so background syncs stand down (the flush — or
+      // its fallback — picks the changes up). A manual sync flushes first.
+      if (!opts.interactive) return;
+      await this.flushPendingMoves();
     }
     if (this.syncInProgress) {
       // Quietly skip — concurrent triggers (file events + periodic timer)
@@ -353,6 +385,9 @@ export default class VaultBridgePlugin extends Plugin {
       if (e.outcome === "failed") {
         return `${time} ${e.trigger}: failed — ${e.errors[0] ?? "unknown"}`;
       }
+      if (e.moved) {
+        return `${time} move: →${e.moved} file(s) renamed remotely`;
+      }
       const deletes = e.deletedLocal + e.deletedRemote;
       const extras =
         (deletes > 0 ? ` ✕${deletes}` : "") +
@@ -400,6 +435,151 @@ export default class VaultBridgePlugin extends Plugin {
     // create/delete/rename and external modifications.)
     this.lastEditTime = Date.now();
     this.debouncedFileSync?.();
+  }
+
+  // --- Rename batching (O3: renames become first-class moves) ---
+
+  /** True when a path is excluded or out of the sync scope. */
+  private outOfScope(path: string): boolean {
+    return (
+      isExcluded(path, this.settings.excludedFolders) ||
+      !isInScope(path, this.settings.scopedFolders)
+    );
+  }
+
+  /**
+   * Obsidian fires `rename` for every affected file — renaming a folder fires
+   * once per descendant as well as for the TFolder itself (verified against
+   * the API docs at build time). Per-file events are the primary source of
+   * moves; the TFolder branch is a defensive expansion for the folder-only
+   * case, and dedupes naturally through the pending map.
+   */
+  private onFileRename(file: TAbstractFile, oldPath: string): void {
+    if (!this.settings.enabled || !this.settings.token) return;
+    this.lastEditTime = Date.now();
+
+    if (file instanceof TFile) {
+      const fromOut = this.outOfScope(oldPath);
+      const toOut = this.outOfScope(file.path);
+      if (fromOut && toOut) return; // never synced, never will be
+      if (fromOut || toOut) {
+        // Half-in-scope: the file appears or disappears from the synced set —
+        // that's an add/delete, not a move; the normal diff handles it.
+        this.debouncedFileSync?.();
+        return;
+      }
+      this.recordMove(oldPath, file.path);
+      this.debouncedMoveFlush?.();
+      return;
+    }
+
+    if (file instanceof TFolder) {
+      this.recordFolderMove(oldPath, file.path);
+      if (this.pendingMoves.size > 0) this.debouncedMoveFlush?.();
+    }
+  }
+
+  /** Coalesce one rename into the pending map (A→B then B→C becomes A→C). */
+  private recordMove(oldPath: string, newPath: string): void {
+    for (const [orig, cur] of this.pendingMoves) {
+      if (cur === oldPath) {
+        if (orig === newPath) {
+          this.pendingMoves.delete(orig); // A→B→A: net no-op
+        } else {
+          this.pendingMoves.set(orig, newPath);
+        }
+        return;
+      }
+    }
+    if (oldPath !== newPath) this.pendingMoves.set(oldPath, newPath);
+  }
+
+  /**
+   * Folder rename → child moves. Retargets pending moves whose destination
+   * sat inside the folder, then expands remaining descendants from the
+   * last-known index (covers a folder-only event; redundant entries from
+   * per-child events dedupe to identical map writes).
+   */
+  private recordFolderMove(oldFolder: string, newFolder: string): void {
+    const oldPrefix = oldFolder + "/";
+    const rebase = (p: string) => newFolder + p.slice(oldFolder.length);
+
+    for (const [orig, cur] of [...this.pendingMoves]) {
+      if (cur.startsWith(oldPrefix)) {
+        this.pendingMoves.set(orig, rebase(cur));
+      }
+    }
+    for (const path of Object.keys(this.lastKnownIndex.files ?? {})) {
+      if (!path.startsWith(oldPrefix) || this.pendingMoves.has(path)) continue;
+      const dest = rebase(path);
+      if (this.outOfScope(dest)) {
+        // Moved out of the synced set — the normal diff handles the delete.
+        this.debouncedFileSync?.();
+        continue;
+      }
+      this.recordMove(path, dest);
+    }
+  }
+
+  /**
+   * Ship the pending renames as a batched move. Mutually exclusive with a
+   * full sync via syncInProgress. Anything the relay refuses (or a transport
+   * failure) falls back to a normal full sync — the O1 guardrail backstops.
+   */
+  private async flushPendingMoves(): Promise<void> {
+    if (this.pendingMoves.size === 0) return;
+    if (!this.settings.enabled || !this.settings.token) {
+      this.pendingMoves.clear();
+      return;
+    }
+    if (this.syncInProgress) {
+      // A sync is mid-flight; try again shortly rather than interleaving.
+      window.setTimeout(
+        () => this.flushPendingMoves().catch(console.error),
+        1000
+      );
+      return;
+    }
+
+    const moves = [...this.pendingMoves].map(([from, to]) => ({ from, to }));
+    this.pendingMoves.clear();
+    this.syncInProgress = true;
+    const startedAt = Date.now();
+    let needFullSync = false;
+    try {
+      const res = await this.engine.moveBatch(moves);
+      if (res.moved > 0) {
+        await this.recordSync({
+          at: new Date().toISOString(),
+          trigger: "auto",
+          outcome: "synced",
+          durationMs: Date.now() - startedAt,
+          pulled: 0,
+          pushed: 0,
+          deletedLocal: 0,
+          deletedRemote: 0,
+          conflicts: 0,
+          errors: [],
+          moved: res.moved,
+        });
+      }
+      if (res.failed.length > 0) {
+        console.warn(
+          "[VaultBridge] Move batch: falling back to full sync for",
+          res.failed
+        );
+        needFullSync = true;
+      }
+    } catch (err) {
+      console.warn(
+        "[VaultBridge] Move batch failed; falling back to full sync:",
+        err
+      );
+      needFullSync = true;
+    } finally {
+      this.syncInProgress = false;
+    }
+    if (needFullSync) await this.syncNow();
   }
 
   // --- Periodic sync timer ---
