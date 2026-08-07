@@ -2,7 +2,7 @@
 
 Sync your Obsidian vault to a Cloudflare R2 bucket so [Claude.ai](https://claude.ai) can read and write your notes from any device, even when your computer is off.
 
-This is the **client plugin**. It pairs with the [Vault Bridge relay](https://vault-bridge.the-empyrean.com) — you'll need a token from your Vault Bridge admin to use it.
+This is the **client plugin**. It pairs with a [Vault Bridge relay](https://github.com/the-empyrean-agora/vault-bridge-relay) — you'll need a relay URL and token from your Vault Bridge admin (or deploy your own relay; see that repo's `docs/DEPLOY.md`).
 
 ## How it works
 
@@ -33,7 +33,7 @@ Obsidian Plugin  ◀──sync──▶  Cloudflare R2  ◀──MCP──▶  C
    - Enable "Vault Bridge"
 4. **Configure**:
    - Settings → Vault Bridge
-   - Paste the token your admin gave you
+   - Enter the relay URL and token your admin gave you
    - Click "Initial upload" to push your existing vault to R2
 5. **Add the connector to Claude.ai**:
    - Open Claude.ai → Settings → Integrations
@@ -59,8 +59,8 @@ Open Settings → Vault Bridge to configure:
 |---|---|
 | **Enabled** | Turn sync on/off without uninstalling the plugin |
 | **Token** | Your Vault Bridge access token (provided by your admin) |
-| **Relay URL** | The Vault Bridge relay endpoint — defaults to `https://vault-bridge.the-empyrean.com` |
-| **Sync interval** | How often to do a full sync check (default: 60 seconds) |
+| **Relay URL** | Your Vault Bridge relay endpoint — from your admin, or your own deployment |
+| **Sync interval** | How often to do a full sync check (default: 180 seconds; periodic syncs pause while you're actively typing) |
 | **Excluded folders** | Comma-separated paths to skip (defaults exclude Obsidian internals) |
 | **Scoped folders** | Optional. If set, sync **only** files under these folders — useful for a secondary device that should see just a subset of the vault (e.g. only `Work/` on a work PC) |
 

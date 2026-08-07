@@ -267,6 +267,11 @@ export class SyncEngine {
     return local;
   }
 
+  /** Auth for every relay call — the token travels as a Bearer header, never in the URL. */
+  private authHeaders(): Record<string, string> {
+    return { Authorization: `Bearer ${this.settings.token}` };
+  }
+
   /**
    * Fetch the remote vault index from R2 (via the relay's sync API).
    * Uses Obsidian's requestUrl API to bypass CORS in the renderer.
@@ -279,9 +284,9 @@ export class SyncEngine {
     index: VaultIndex;
     remoteWriteActive: boolean;
   }> {
-    const url = `${this.settings.relayUrl}/sync/index?token=${this.settings.token}`;
+    const url = `${this.settings.relayUrl}/sync/index`;
     return withRetry(async () => {
-      const resp = await requestUrl({ url, method: "GET", throw: false });
+      const resp = await requestUrl({ url, method: "GET", headers: this.authHeaders(), throw: false });
       if (resp.status < 200 || resp.status >= 300) {
         throw new Error(`Failed to fetch index: ${resp.status}`);
       }
@@ -299,9 +304,9 @@ export class SyncEngine {
    * Download a file from R2.
    */
   private async pullFile(path: string): Promise<string> {
-    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}?token=${this.settings.token}`;
+    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}`;
     return withRetry(async () => {
-      const resp = await requestUrl({ url, method: "GET", throw: false });
+      const resp = await requestUrl({ url, method: "GET", headers: this.authHeaders(), throw: false });
       if (resp.status < 200 || resp.status >= 300) {
         throw new Error(`Failed to pull ${path}: ${resp.status}`);
       }
@@ -320,9 +325,12 @@ export class SyncEngine {
     content: string,
     opts: { ifMatch?: string; ifNoneMatch?: string } = {}
   ): Promise<void> {
-    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}?token=${this.settings.token}`;
+    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}`;
     await withRetry(async () => {
-      const headers: Record<string, string> = { "Content-Type": "text/markdown" };
+      const headers: Record<string, string> = {
+        "Content-Type": "text/markdown",
+        ...this.authHeaders(),
+      };
       if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
       if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
       const resp = await requestUrl({
@@ -348,9 +356,9 @@ export class SyncEngine {
     path: string,
     opts: { ifMatch?: string } = {}
   ): Promise<void> {
-    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}?token=${this.settings.token}`;
+    const url = `${this.settings.relayUrl}/sync/files/${encodeURI(path)}`;
     await withRetry(async () => {
-      const headers: Record<string, string> = {};
+      const headers: Record<string, string> = this.authHeaders();
       if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
       const resp = await requestUrl({ url, method: "DELETE", headers, throw: false });
       if (resp.status === 412) throw new PreconditionFailedError(path);
@@ -367,12 +375,12 @@ export class SyncEngine {
   private async postMoves(
     items: Array<{ from: string; to: string; ifMatch?: string }>
   ): Promise<Array<{ from: string; to: string; status: number }>> {
-    const url = `${this.settings.relayUrl}/sync/move?token=${this.settings.token}`;
+    const url = `${this.settings.relayUrl}/sync/move`;
     return withRetry(async () => {
       const resp = await requestUrl({
         url,
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...this.authHeaders() },
         body: JSON.stringify({ moves: items }),
         throw: false,
       });

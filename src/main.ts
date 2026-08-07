@@ -162,7 +162,7 @@ export default class VaultBridgePlugin extends Plugin {
 
     // Initial sync on load (after Obsidian finishes indexing)
     this.app.workspace.onLayoutReady(() => {
-      if (this.settings.enabled && this.settings.token) {
+      if (this.settings.enabled && this.isConfigured()) {
         setTimeout(() => this.syncNow().catch(console.error), 2000);
       }
     });
@@ -219,6 +219,11 @@ export default class VaultBridgePlugin extends Plugin {
     this.statusBarItem.title = `Vault Bridge: ${status}${message ? " — " + message : ""}`;
   }
 
+  /** True when both relay URL and token are set — the minimum needed to talk to a relay. */
+  private isConfigured(): boolean {
+    return Boolean(this.settings.relayUrl && this.settings.token);
+  }
+
   // --- Sync orchestration ---
 
   /**
@@ -232,8 +237,8 @@ export default class VaultBridgePlugin extends Plugin {
       new Notice("Vault Bridge is disabled. Enable in settings.");
       return;
     }
-    if (!this.settings.token) {
-      new Notice("Vault Bridge: no token configured. Open settings.");
+    if (!this.isConfigured()) {
+      new Notice("Vault Bridge: set the relay URL and token in settings first.");
       return;
     }
     if (this.pendingMoves.size > 0) {
@@ -402,8 +407,8 @@ export default class VaultBridgePlugin extends Plugin {
   }
 
   async initialUpload(): Promise<void> {
-    if (!this.settings.token) {
-      new Notice("Vault Bridge: no token configured. Open settings.");
+    if (!this.isConfigured()) {
+      new Notice("Vault Bridge: set the relay URL and token in settings first.");
       return;
     }
     if (this.syncInProgress) {
@@ -424,7 +429,7 @@ export default class VaultBridgePlugin extends Plugin {
   }
 
   private onFileChange(file: TAbstractFile): void {
-    if (!this.settings.enabled || !this.settings.token) return;
+    if (!this.settings.enabled || !this.isConfigured()) return;
     if (!(file instanceof TFile)) return;
     // Skip Obsidian internal events for excluded paths
     for (const ex of this.settings.excludedFolders) {
@@ -455,7 +460,7 @@ export default class VaultBridgePlugin extends Plugin {
    * case, and dedupes naturally through the pending map.
    */
   private onFileRename(file: TAbstractFile, oldPath: string): void {
-    if (!this.settings.enabled || !this.settings.token) return;
+    if (!this.settings.enabled || !this.isConfigured()) return;
     this.lastEditTime = Date.now();
 
     if (file instanceof TFile) {
@@ -528,7 +533,7 @@ export default class VaultBridgePlugin extends Plugin {
    */
   private async flushPendingMoves(): Promise<void> {
     if (this.pendingMoves.size === 0) return;
-    if (!this.settings.enabled || !this.settings.token) {
+    if (!this.settings.enabled || !this.isConfigured()) {
       this.pendingMoves.clear();
       return;
     }

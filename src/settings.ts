@@ -30,7 +30,7 @@ export interface VaultBridgeSettings {
 
 export const DEFAULT_SETTINGS: VaultBridgeSettings = {
   token: "",
-  relayUrl: "https://vault-bridge.the-empyrean.com",
+  relayUrl: "",
   syncIntervalSeconds: 180,
   excludedFolders: [".obsidian/plugins", ".obsidian/workspace.json", ".trash"],
   scopedFolders: [],
@@ -86,10 +86,10 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Relay URL")
-      .setDesc("The Vault Bridge relay endpoint.")
+      .setDesc("Your Vault Bridge relay endpoint — from your admin, or your own deployment.")
       .addText((text) =>
         text
-          .setPlaceholder("https://vault-bridge.the-empyrean.com")
+          .setPlaceholder("https://vault-bridge.example.com")
           .setValue(this.plugin.settings.relayUrl)
           .onChange(async (value) => {
             this.plugin.settings.relayUrl = value.trim().replace(/\/$/, "");
@@ -264,8 +264,8 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
 
   private async saveLlmSecret(): Promise<void> {
     const { token, relayUrl, llmProvider, llmApiKey, llmModel } = this.plugin.settings;
-    if (!token) {
-      new Notice("Vault Bridge: set your token first.");
+    if (!token || !relayUrl) {
+      new Notice("Vault Bridge: set your relay URL and token first.");
       return;
     }
     if (!llmApiKey) {
@@ -279,12 +279,15 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
     };
     if (llmModel) body.model = llmModel;
 
-    const url = `${relayUrl}/secrets/llm?token=${encodeURIComponent(token)}`;
+    const url = `${relayUrl}/secrets/llm`;
     try {
       const resp = await requestUrl({
         url,
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify(body),
         throw: false,
       });
@@ -300,13 +303,18 @@ export class VaultBridgeSettingTab extends PluginSettingTab {
 
   private async clearLlmSecret(): Promise<void> {
     const { token, relayUrl } = this.plugin.settings;
-    if (!token) {
-      new Notice("Vault Bridge: set your token first.");
+    if (!token || !relayUrl) {
+      new Notice("Vault Bridge: set your relay URL and token first.");
       return;
     }
-    const url = `${relayUrl}/secrets/llm?token=${encodeURIComponent(token)}`;
+    const url = `${relayUrl}/secrets/llm`;
     try {
-      const resp = await requestUrl({ url, method: "DELETE", throw: false });
+      const resp = await requestUrl({
+        url,
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+        throw: false,
+      });
       if (resp.status >= 200 && resp.status < 300) {
         new Notice("Email agent settings cleared on relay.");
       } else {
